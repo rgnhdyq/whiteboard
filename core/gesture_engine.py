@@ -29,6 +29,9 @@ class GestureEngine:
         # 摄像头帧（供外部读取预览）
         self.current_frame = None
         self.frame_lock = threading.Lock()
+        
+        # 动态手势是否启用
+        self._dynamic_gesture_enabled = False
 
         # FPS
         self.fps = 0
@@ -61,10 +64,13 @@ class GestureEngine:
         self._hand_detector = HandDetector(
             static_image_mode=False,
             max_num_hands=2,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.7,
+            min_detection_confidence=0.5,  # 降低检测阈值，让快速移动的模糊手也能被捕获
+            min_tracking_confidence=0.4,   # 降低跟踪阈值，减少快速运动时的丢手
         )
+        self._hand_loss_counter = 0     # 丢手计数器
+        self._HAND_LOSS_GRACE = 10      # 允许丢手最多 10 帧（约 0.3 秒），期间保留轨迹
         self._gesture_detector = GestureDetector()
+        self._gesture_detector.enable_dynamic = self._dynamic_gesture_enabled
         print("[Engine] MediaPipe 初始化完成")
 
     def _run_loop(self):
@@ -79,6 +85,7 @@ class GestureEngine:
 
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 60)  # 尝试向摄像头请求 60 帧
 
         while self._running:
             ret, frame = cap.read()
@@ -87,26 +94,31 @@ class GestureEngine:
 
             frame = cv2.flip(frame, 1)
 
-            # 保存当前帧并转换为 RGB（供预览）
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            with self.frame_lock:
-                self.current_frame = frame_rgb
-
             # 手势检测
             all_hands = self._hand_detector.process_frame_multi(frame)
 
             if all_hands:
+                self._hand_loss_counter = 0  # 手回来了，重置丢手计数器
                 gesture_data = self._gesture_detector.detect_gestures(all_hands, frame.shape)
                 gesture_data['timestamp'] = time.time()
 
                 # 骨骼绘制到帧上并转换为 RGB
                 frame_with_skeleton = self._hand_detector.draw_landmarks_multi(frame, all_hands)
-                frame_with_skeleton_rgb = cv2.cvtColor(frame_with_skeleton, cv2.COLOR_BGR2RGB)
-                with self.frame_lock:
-                    self.current_frame = frame_with_skeleton_rgb
+                final_frame = cv2.cvtColor(frame_with_skeleton, cv2.COLOR_BGR2RGB)
             else:
-                gesture_data = self._gesture_detector._empty_result()
-                gesture_data['timestamp'] = time.time()
+                self._hand_loss_counter += 1
+                if self._hand_loss_counter <= self._HAND_LOSS_GRACE:
+                    # 丢手宽容期内：不要调用 _empty_result，保持轨迹缓冲区不被打断
+                    gesture_data = {'timestamp': time.time()}
+                else:
+                    # 手真的丢太久了，正式放弃
+                    gesture_data = self._gesture_detector._empty_result()
+                    gesture_data['timestamp'] = time.time()
+                final_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+            # 统一在最后更新一次预览帧，防止 UI 线程在中途读到没画骨骼的纯净画面导致闪烁
+            with self.frame_lock:
+                self.current_frame = final_frame
 
             # 输出到队列（非阻塞，丢弃旧数据）
             try:
@@ -150,3 +162,9 @@ class GestureEngine:
         """获取当前摄像头帧（线程安全）"""
         with self.frame_lock:
             return self.current_frame.copy() if self.current_frame is not None else None
+
+    def set_dynamic_gesture_enabled(self, enabled: bool):
+        """线程安全地启闭动态手势识别"""
+        self._dynamic_gesture_enabled = enabled
+        if self._gesture_detector:
+            self._gesture_detector.enable_dynamic = enabled

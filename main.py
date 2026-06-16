@@ -8,6 +8,12 @@ import sys
 import queue
 import signal
 
+# 修复 Windows 下 PyTorch 与 PyQt 的 DLL 冲突 (WinError 1114)
+try:
+    import torch
+except ImportError:
+    pass
+
 # Ctrl+C 优雅退出
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 

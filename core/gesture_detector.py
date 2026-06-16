@@ -1,8 +1,8 @@
 """
 手势检测器 v4
-改动：
+改动:
   1. 引入 1 Euro Filter 替代简单低通滤波
-  2. 引入"空中数位板"：中心 50% 区域绝对映射到全屏
+  2. 引入"空中数位板":中心 50% 区域绝对映射到全屏
   3. 保留松开缓冲期、防抖、擦除/撤销手势
 """
 
@@ -10,22 +10,23 @@ import numpy as np
 from typing import Dict, Tuple, Optional, List
 import time
 from collections import deque
+from core.transformer_gesture import load_model
 
 
 # ==============================================================================
 # 1 Euro Filter 实现
-# 参考：https://gery.casiez.net/1euro/
-# 低速 → 重平滑（去抖），高速 → 轻平滑（低延迟）
+# 参考:https://gery.casiez.net/1euro/
+# 低速 → 重平滑(去抖),高速 → 轻平滑(低延迟)
 # ==============================================================================
 
 class OneEuroFilter:
     """
-    1 Euro Filter：自适应低通滤波器。
+    1 Euro Filter:自适应低通滤波器。
 
-    参数：
-        mincutoff: 最小截止频率（Hz），越小平滑越强。默认 1.0
-        beta: 速度系数，越大高速响应越快。默认 0.007
-        dcutoff: 导数截止频率（Hz），通常固定 1.0
+    参数:
+        mincutoff: 最小截止频率(Hz),越小平滑越强。默认 1.0
+        beta: 速度系数,越大高速响应越快。默认 0.007
+        dcutoff: 导数截止频率(Hz),通常固定 1.0
     """
 
     def __init__(self, mincutoff: float = 1.0, beta: float = 0.007, dcutoff: float = 1.0):
@@ -48,7 +49,7 @@ class OneEuroFilter:
 
         Args:
             x: 原始值
-            t: 时间戳（秒）。None 则使用 time.time()
+            t: 时间戳(秒)。None 则使用 time.time()
         Returns:
             滤波后的值
         """
@@ -56,7 +57,7 @@ class OneEuroFilter:
             t = time.time()
 
         if self._t_prev is None:
-            # 第一次调用，直接初始化
+            # 第一次调用,直接初始化
             self._x_prev = x
             self._dx_prev = 0.0
             self._t_prev = t
@@ -64,9 +65,9 @@ class OneEuroFilter:
 
         dt = t - self._t_prev
         if dt <= 0:
-            dt = 1.0 / 60.0  # 兜底：假设 60fps
+            dt = 1.0 / 60.0  # 兜底:假设 60fps
 
-        # 1. 估算变化速度（导数）
+        # 1. 估算变化速度(导数)
         dx = (x - self._x_prev) / dt
 
         # 2. 对导数做低通滤波
@@ -89,7 +90,7 @@ class OneEuroFilter:
         return x_hat
 
     def reset(self):
-        """重置滤波器状态（断笔重画时调用，防止飞线）"""
+        """重置滤波器状态(断笔重画时调用,防止飞线)"""
         self._x_prev = None
         self._dx_prev = 0.0
         self._t_prev = None
@@ -124,6 +125,14 @@ class GestureDetector:
 
         self.control_active = True
 
+        # 加载 Transformer 动态手势模型
+        try:
+            self.transformer_model = load_model()
+            self.transformer_available = True
+        except Exception as e:
+            print(f"[手势检测] Transformer 加载失败: {e}")
+            self.transformer_available = False
+
         # 点击/拖拽
         self.left_click_down = False
         self.last_click_time = 0
@@ -139,7 +148,14 @@ class GestureDetector:
         )
         self._filter_initialized = False
 
-        # ===== 空中数位板：中心区域映射 =====
+        self._euro_filter_secondary = OneEuroFilter3D(
+            mincutoff=euro_cfg['mincutoff'],
+            beta=euro_cfg['beta'],
+            dcutoff=euro_cfg['dcutoff'],
+        )
+        self._filter_secondary_initialized = False
+
+        # ===== 空中数位板:中心区域映射 =====
         tablet_cfg = self.config['tablet']
         self._tablet_x_min = tablet_cfg['x_min']  # 0.25
         self._tablet_x_max = tablet_cfg['x_max']  # 0.75
@@ -157,11 +173,12 @@ class GestureDetector:
         self._release_counter = 0
         self._was_pinching = False
 
-        # ===== 捏合确认窗口（防止误触）=====
+        # ===== 捏合确认窗口(防止误触)=====
         # 捏合必须持续 PINCH_HOLD_SECONDS 秒才开始画
         self.PINCH_HOLD_SECONDS = 1.0
         self._pinch_start_time = 0.0
-        self._pinch_confirmed = False  # 捏合已确认（超过1秒）
+        self._pinch_confirmed = False  # 捏合已确认
+        self._erase_frames = 0         # 橡皮擦防抖计数器
 
         # 拍手检测
         self.last_clap_time = 0
@@ -173,6 +190,15 @@ class GestureDetector:
         # 双食指碰撞状态机
         self.index_touching = False
         self.last_index_touches = []
+
+        # ===== DHG 动态手势缓冲区 =====
+        self.point_history = deque(maxlen=150) # 允许长达 5 秒的动作轨迹
+        self.pinch_history = deque(maxlen=15) # 追踪拇指和食指的距离变化
+        self.dynamic_cooldown = 0.0
+        self._finger_retract_counter = 0
+        self._RETRACT_SETTLE_FRAMES = 12  # 食指必须连续收起 12 帧才算"真正画完"(给 MediaPipe 重新锁定手指的时间)
+
+        self.enable_dynamic = False
 
         self.debug = False
 
@@ -191,12 +217,12 @@ class GestureDetector:
             'smoothing': {
                 # 1 Euro Filter 参数
                 'euro_filter': {
-                    'mincutoff': 1.0,   # 最小截止频率，越小越平滑
-                    'beta': 0.007,      # 速度系数，越大高速响应越快
+                    'mincutoff': 1.0,   # 最小截止频率,越小越平滑
+                    'beta': 0.007,      # 速度系数,越大高速响应越快
                     'dcutoff': 1.0,     # 导数截止频率
                 },
             },
-            # 空中数位板：中心区域映射
+            # 空中数位板:中心区域映射
             # 摄像头视野中心 50% 区域映射到全屏 0~1
             'tablet': {
                 'x_min': 0.25,  # 左边界
@@ -228,7 +254,7 @@ class GestureDetector:
         """
         将摄像头视野中心区域映射到全屏归一化坐标。
 
-        原始坐标范围：[x_min, x_max] → 映射后：[0.0, 1.0]
+        原始坐标范围:[x_min, x_max] → 映射后:[0.0, 1.0]
         超出中心区域的部分被 clip 截断。
         """
         x = (raw_pos[0] - self._tablet_x_min) / self._tablet_x_range
@@ -255,65 +281,177 @@ class GestureDetector:
         primary_hand = hands_data[0] if hands_data else None
 
         if primary_hand is None:
-            # 手丢失 → 重置滤波器（防止下次出现时飞线）
+            # 手丢失 → 重置滤波器(防止下次出现时飞线)
             if self._filter_initialized:
                 self._euro_filter.reset()
                 self._filter_initialized = False
-            return self._empty_result()
+
+            # 手彻底离开画面时,如果有遗留的轨迹,强制进行结算!防止轨迹一直堆积
+            dynamic_gesture = None
+            if getattr(self, 'enable_dynamic', False) and len(self.point_history) >= 5 and current_time > self.dynamic_cooldown and self.transformer_available:
+                seq = np.array(list(self.point_history), dtype=np.float32)
+                L = len(seq)
+                target_L = 30
+                resampled_seq = np.zeros((target_L, seq.shape[1]), dtype=np.float32)
+                old_indices = np.linspace(0, L - 1, L)
+                new_indices = np.linspace(0, L - 1, target_L)
+                for dim in range(seq.shape[1]):
+                    resampled_seq[:, dim] = np.interp(new_indices, old_indices, seq[:, dim])
+
+                best_match, score = self.transformer_model.predict(resampled_seq, threshold=0.45)
+                print(f"[DHG 丢手强制结算] 帧数: {L} | 匹配: {best_match} | 置信度: {score:.2f}")
+                if best_match != 'None':
+                    dynamic_gesture = best_match
+                    self.dynamic_cooldown = current_time + 1.0
+
+            self.point_history.clear()
+            self._finger_retract_counter = 0
+
+            res = self._empty_result()
+            if dynamic_gesture:
+                res['dynamic_gesture'] = dynamic_gesture
+
+            if self._filter_secondary_initialized:
+                self._euro_filter_secondary.reset()
+                self._filter_secondary_initialized = False
+            return res
 
         keypoints = primary_hand
 
-        # 参考指节长度
+        # ===== 手指状态检测 =====
         index_segment = self._euclidean_distance(
-            keypoints['index_mcp'], keypoints.get('index_pip', keypoints['index_mcp']))
+            keypoints.get('index_pip'), keypoints['index_mcp'])
 
-        # 手指伸出状态（食指采用放宽的 0.45 门槛，其余手指维持 0.6）
         index_extended = self._is_finger_extended(keypoints, 'index', threshold=0.45)
         thumb_extended = self._is_finger_extended(keypoints, 'thumb')
         middle_extended = self._is_finger_extended(keypoints, 'middle')
         ring_extended = self._is_finger_extended(keypoints, 'ring')
         pinky_extended = self._is_finger_extended(keypoints, 'pinky')
 
-        # 指尖触碰
-        thumb_index_touching = self._are_fingers_touching(
-            keypoints, 'thumb', 'index', index_segment)
+        thumb_index_touching = self._are_fingers_touching(keypoints, 'thumb', 'index', index_segment)
         thumb_ring_touching = False
         if thumb_extended:
-            thumb_ring_touching = self._are_fingers_touching(
-                keypoints, 'thumb', 'ring', index_segment)
+            thumb_ring_touching = self._are_fingers_touching(keypoints, 'thumb', 'ring', index_segment)
 
         hand_open = self._detect_hand_open(keypoints)
 
-        # ===== 食指位置处理流水线 =====
-        # 1. 原始坐标（归一化 0~1，摄像头视野）
+        # 位置映射
         raw_pos = keypoints['index_tip']
-
-        # 2. 空中数位板映射：中心 50% → 全屏 0~1
         mapped_pos = self._tablet_map(raw_pos)
-
-        # 3. 1 Euro Filter 自适应平滑
         index_pos = self._euro_filter(mapped_pos, current_time)
         self._filter_initialized = True
 
+        # ===== 动态手势轨迹采集与识别 =====
+        dynamic_gesture = None
+
+        # 判断当前是否处于捏合/画线状态
+        is_pinching_primary = index_extended and self._is_thumb_near_index_pip(keypoints, index_segment)
+
+        # 动态手势采集条件：食指伸出时采集（不限制其他手指，兼容 V/X 等多指手势）
+        # 仅排除捏合状态（避免采集画线轨迹）
+        is_gesture_collecting = index_extended and not is_pinching_primary
+
+        if not getattr(self, 'enable_dynamic', False):
+            # 动态手势关闭 → 清空轨迹
+            if len(self.point_history) > 0:
+                print(f"[DHG] 动态手势关闭，清空轨迹 ({len(self.point_history)} 帧)")
+            self.point_history.clear()
+            self._finger_retract_counter = 0
+        elif is_gesture_collecting:
+            # 食指伸出 → 采集轨迹
+            hand_features = self._extract_raw_features(keypoints)
+            self.point_history.append(hand_features)
+            self._finger_retract_counter = 0
+
+            # 实时触发：非捏合状态下，积累足够帧数后立即识别
+            if not is_pinching_primary and len(self.point_history) >= 15 and current_time > self.dynamic_cooldown and self.transformer_available:
+                if len(self.point_history) == 15:
+                    print(f"[DHG] 开始识别 | 帧数: {len(self.point_history)} | enable_dynamic: {self.enable_dynamic}")
+                seq = np.array(list(self.point_history), dtype=np.float32)
+                L = len(seq)
+                target_L = 30
+                resampled_seq = np.zeros((target_L, seq.shape[1]), dtype=np.float32)
+                old_indices = np.linspace(0, L - 1, L)
+                new_indices = np.linspace(0, L - 1, target_L)
+                for dim in range(seq.shape[1]):
+                    resampled_seq[:, dim] = np.interp(new_indices, old_indices, seq[:, dim])
+
+                best_match, score = self.transformer_model.predict(resampled_seq, threshold=0.9)
+                if best_match != 'None':
+                    print(f"[DHG real-time] Done! Frames: {L} | Match: {best_match} | Conf: {score:.2f}")
+                    dynamic_gesture = best_match
+                    self.dynamic_cooldown = current_time + 1.5
+                    self.point_history.clear()
+        else:
+            # 食指收起或捏合 → 结算轨迹
+            if len(self.point_history) >= 5:
+                self._finger_retract_counter += 1
+
+                if self._finger_retract_counter >= self._RETRACT_SETTLE_FRAMES:
+                    if current_time > self.dynamic_cooldown and self.transformer_available:
+                        seq = np.array(list(self.point_history), dtype=np.float32)
+                        L = len(seq)
+                        target_L = 30
+                        old_indices = np.linspace(0, L - 1, L)
+                        new_indices = np.linspace(0, L - 1, target_L)
+                        resampled_seq = np.zeros((target_L, 63), dtype=np.float32)
+                        for dim in range(63):
+                            resampled_seq[:, dim] = np.interp(new_indices, old_indices, seq[:, dim])
+
+                        best_match, score = self.transformer_model.predict(resampled_seq, threshold=0.45)
+                        print(f"[DHG settle] Frames: {len(self.point_history)} | Match: {best_match} | Conf: {score:.2f}")
+
+                        if best_match != 'None':
+                            dynamic_gesture = best_match
+                            self.dynamic_cooldown = current_time + 1.0
+
+                    self.point_history.clear()
+                    self._finger_retract_counter = 0
+            else:
+                # 轨迹太短（不到5帧），直接丢弃
+                self.point_history.clear()
+                self._finger_retract_counter = 0
+
+        # ===== 第二只手处理(用于双手缩放)=====
+        secondary_index_pos = None
+        is_pinching_secondary = False
+
+        if len(hands_data) > 1:
+            sec_hand = hands_data[1]
+            sec_index_segment = self._euclidean_distance(
+                sec_hand['index_mcp'], sec_hand.get('index_pip', sec_hand['index_mcp']))
+            sec_index_extended = self._is_finger_extended(sec_hand, 'index', threshold=0.45)
+
+            is_pinching_secondary = sec_index_extended and self._is_thumb_near_index_pip(sec_hand, sec_index_segment)
+
+            sec_raw_pos = sec_hand['index_tip']
+            sec_mapped_pos = self._tablet_map(sec_raw_pos)
+            secondary_index_pos = self._euro_filter_secondary(sec_mapped_pos, current_time)
+            self._filter_secondary_initialized = True
+        else:
+            if self._filter_secondary_initialized:
+                self._euro_filter_secondary.reset()
+                self._filter_secondary_initialized = False
+
         # ===== 松开缓冲期 + 捏合确认窗口 =====
-        is_pinching = index_extended and self._is_thumb_near_index_pip(keypoints, index_segment)
+        is_pinching = is_pinching_primary
         drawing_active = False
 
         if is_pinching:
             if not self._was_pinching:
-                # 新的捏合开始，记录起始时间
+                # 新的捏合开始,记录起始时间
                 self._pinch_start_time = current_time
                 self._pinch_confirmed = False
             self._was_pinching = True
 
             hold_duration = current_time - self._pinch_start_time
             if hold_duration >= self.PINCH_HOLD_SECONDS:
-                # 捏合已确认（超过1秒），开始画画
+                # 捏合已确认(超过1秒),开始画画
                 self._pinch_confirmed = True
                 drawing_active = True
                 self._release_counter = self.RELEASE_HOLD_FRAMES
             else:
-                # 还在确认窗口内，不算画画（避免误触）
+                # 还在确认窗口内,不算画画(避免误触)
                 drawing_active = False
             # 进度 0~1
             pinch_progress = min(hold_duration / self.PINCH_HOLD_SECONDS, 1.0)
@@ -329,7 +467,7 @@ class GestureDetector:
                     self._was_pinching = False
                     self._pinch_confirmed = False
             else:
-                # 未确认的捏合松开（不到1秒就松了）→ 重置，不算画画
+                # 未确认的捏合松开(不到1秒就松了)→ 重置,不算画画
                 self._was_pinching = False
                 self._pinch_confirmed = False
                 pinch_progress = 0.0
@@ -344,11 +482,19 @@ class GestureDetector:
         # 激光笔
         laser_active = index_extended and not drawing_active
 
-        # 擦除手势：五指张开（放宽条件：只要求食/中/无/小四指伸直，且不与拇指捏合，避免MediaPipe拇指判定不稳造成的擦除中断）
-        erase_gesture = (index_extended and middle_extended and ring_extended
-                         and pinky_extended and not thumb_index_touching)
+        # 擦除手势:五指张开(放宽条件:只要求食/中/无/小四指伸直,且不与拇指捏合)
+        raw_erase_gesture = (index_extended and middle_extended and ring_extended
+                             and pinky_extended and not thumb_index_touching)
+        # 增加防抖缓冲:必须连续 10 帧(约 0.3 秒)识别为张开,才算真正的橡皮擦,彻底解决动态手势误触
+        if raw_erase_gesture:
+            self._erase_frames += 1
+        else:
+            self._erase_frames = 0
 
-        # 模式切换已移至拍手，蜘蛛侠手势废弃
+        erase_gesture = (self._erase_frames >= 10)
+        self._is_currently_erasing = erase_gesture
+
+        # 模式切换已移至拍手,蜘蛛侠手势废弃
         mode_switch_gesture = False
 
         # 点击事件
@@ -363,8 +509,8 @@ class GestureDetector:
             'thumb_index_touching': thumb_index_touching,
             'thumb_ring_touching': thumb_ring_touching,
             'index_position': index_pos,
-            'raw_position': raw_pos,        # 原始坐标（调试用）
-            'mapped_position': mapped_pos,   # 数位板映射后（调试用）
+            'raw_position': raw_pos,        # 原始坐标(调试用)
+            'mapped_position': mapped_pos,   # 数位板映射后(调试用)
             'click_events': click_events,
             'keypoints': keypoints,
             'middle_extended': middle_extended,
@@ -374,9 +520,13 @@ class GestureDetector:
             'laser_active': laser_active,
             'drawing_active': drawing_active,
             'pinch_progress': pinch_progress,
+            'primary_is_pinching': is_pinching_primary,
+            'secondary_is_pinching': is_pinching_secondary,
+            'secondary_index_position': secondary_index_pos,
             'erase_gesture': erase_gesture,
             'mode_switch_gesture': mode_switch_gesture,
             # 动态手势
+            'dynamic_gesture': dynamic_gesture,
             'clap_detected': clap_detected,
             'num_hands': len(hands_data),
         }
@@ -477,42 +627,70 @@ class GestureDetector:
         else:
             raise ValueError(f"未知的 landmarks 格式: {type(landmarks)}")
 
+    def _extract_raw_features(self, keypoints: Dict) -> np.ndarray:
+        """从字典提取 21x3=63 维向量,供 Transformer 使用"""
+        POINT_NAMES = [
+            'wrist',
+            'thumb_cmc', 'thumb_mcp', 'thumb_ip', 'thumb_tip',
+            'index_mcp', 'index_pip', 'index_dip', 'index_tip',
+            'middle_mcp', 'middle_pip', 'middle_dip', 'middle_tip',
+            'ring_mcp', 'ring_pip', 'ring_dip', 'ring_tip',
+            'pinky_mcp', 'pinky_pip', 'pinky_dip', 'pinky_tip',
+        ]
+        coords = []
+        for name in POINT_NAMES:
+            p = keypoints.get(name, (0.0, 0.0, 0.0))
+            coords.extend([p[0], p[1], p[2]])
+        return np.array(coords, dtype=np.float32)
+
     # ===================== 手指判断 =====================
 
     def _is_finger_extended(self, keypoints: Dict, finger: str, threshold: float = 0.6) -> bool:
         wrist = keypoints['wrist']
         tip = keypoints.get(finger + '_tip')
         mcp = keypoints.get(finger + '_mcp')
+
         if not tip or not mcp:
             return False
 
-        tip_mcp = self._euclidean_distance(tip, mcp)
-        mcp_wrist = self._euclidean_distance(mcp, wrist)
+        # 大拇指特殊处理:由于大拇指是横向运动,恢复原有且验证过的高效比例判断逻辑
+        if finger == 'thumb':
+            tip_mcp = self._euclidean_distance(tip, mcp)
+            mcp_wrist = self._euclidean_distance(mcp, wrist)
+            if mcp_wrist < 0.01:
+                return False
+            return (tip_mcp / mcp_wrist) > threshold
 
-        if mcp_wrist < 0.01:
+        # 对于食指、中指、无名指、小指,使用稳定的 3D 拓扑判断:
+        pip = keypoints.get(finger + '_pip')
+        if not pip:
             return False
 
-        ratio = tip_mcp / mcp_wrist
+        tip_wrist = self._euclidean_distance(tip, wrist)
+        pip_wrist = self._euclidean_distance(pip, wrist)
 
-        # 针对食指的透视缩短（正指屏幕）进行智能生理排他性补偿
+        # 拓扑判断:如果指尖到手腕的距离大于第二指节到手腕的距离,说明手指处于伸开状态
+        is_extended = tip_wrist > pip_wrist
+
+        # 针对食指的透视缩短(正指屏幕)进行智能生理排他性补偿
         if finger == 'index' and threshold <= 0.45:
-            if ratio > threshold:
+            if is_extended:
                 return True
-            if ratio > 0.05:
-                # 检查中指、无名指、小指是否都处于弯曲蜷缩状态
+            # 如果食指略微弯曲(由于正对摄像头导致透视压缩),但在容差范围内
+            if tip_wrist > pip_wrist * 0.8:
+                # 检查中指、无名指、小指是否都处于完全弯曲状态
                 other_curled = True
                 for f in ['middle', 'ring', 'pinky']:
                      f_tip = keypoints.get(f + '_tip')
-                     f_mcp = keypoints.get(f + '_mcp')
-                     if f_tip and f_mcp:
-                         f_ratio = self._euclidean_distance(f_tip, f_mcp) / mcp_wrist
-                         if f_ratio > 0.45:
+                     f_pip = keypoints.get(f + '_pip')
+                     if f_tip and f_pip:
+                         if self._euclidean_distance(f_tip, wrist) > self._euclidean_distance(f_pip, wrist):
                              other_curled = False
                              break
                 if other_curled:
                     return True
 
-        return ratio > threshold
+        return is_extended
 
     def _is_thumb_near_index_pip(self, keypoints: Dict, reference_length: float = None) -> bool:
         thumb_tip = keypoints.get('thumb_tip')
@@ -522,8 +700,8 @@ class GestureDetector:
         index_mcp = keypoints.get('index_mcp')
         if not all([thumb_tip, index_pip, index_tip, wrist, index_mcp]):
             return False
-            
-        # 同时计算大拇指尖到食指第二关节及指尖的 2D 二维投影距离，取最小值
+
+        # 同时计算大拇指尖到食指第二关节及指尖的 2D 二维投影距离,取最小值
         d_thumb_pip_2d = np.sqrt((thumb_tip[0] - index_pip[0]) ** 2 +
                                  (thumb_tip[1] - index_pip[1]) ** 2)
         d_thumb_tip_2d = np.sqrt((thumb_tip[0] - index_tip[0]) ** 2 +
@@ -532,11 +710,11 @@ class GestureDetector:
 
         d_palm_2d = np.sqrt((index_mcp[0] - wrist[0]) ** 2 +
                             (index_mcp[1] - wrist[1]) ** 2)
-        
+
         if d_palm_2d < 0.01:
             return False
 
-        # 适当放宽比例阈值至 0.45，包容微弯和指向屏幕时的透视压缩
+        # 适当放宽比例阈值至 0.45,包容微弯和指向屏幕时的透视压缩
         return min_d_2d < d_palm_2d * 0.45
 
     def _are_fingers_touching(self, keypoints: Dict, finger1: str, finger2: str,
@@ -572,50 +750,50 @@ class GestureDetector:
         # 1. 检查两只手的食指是否都伸直
         hand1_index_extended = self._is_finger_extended(hand1, 'index', threshold=0.45)
         hand2_index_extended = self._is_finger_extended(hand2, 'index', threshold=0.45)
-        
+
         if not (hand1_index_extended and hand2_index_extended):
-            # 如果有一只手的食指没伸出，视为分开状态
+            # 如果有一只手的食指没伸出,视为分开状态
             self.index_touching = False
             return False
 
         # 2. 计算食指指尖之间的 3D 欧氏距离
         d_tips = self._euclidean_distance(hand1['index_tip'], hand2['index_tip'])
-        
-        # 归一化参考长度（使用 hand1 的手掌长度）
+
+        # 归一化参考长度(使用 hand1 的手掌长度)
         palm_len = self._euclidean_distance(hand1['wrist'], hand1['index_mcp'])
         if palm_len < 0.01:
             palm_len = 0.12  # 兜底值
-            
+
         touch_threshold = palm_len * 0.45  # 大约 0.05
         release_threshold = palm_len * 0.65  # 大约 0.08
-        
+
         if d_tips < touch_threshold:
             if not self.index_touching:
-                # 刚刚产生接触，记录时间戳
+                # 刚刚产生接触,记录时间戳
                 self.index_touching = True
                 self.last_index_touches.append(current_time)
                 # 只保留最近两次接触时间戳
                 if len(self.last_index_touches) > 2:
                     self.last_index_touches.pop(0)
-                
+
                 # 后台实时打印碰撞检测日志与时间戳
                 if len(self.last_index_touches) == 1:
-                    print(f"[手势] 第一次食指相碰检测成功！时间戳: {current_time:.2f}")
+                    print(f"[手势] 第一次食指相碰检测成功!时间戳: {current_time:.2f}")
                 elif len(self.last_index_touches) == 2:
-                    print(f"[手势] 第二次食指相碰检测成功！时间戳: {current_time:.2f}")
-                
+                    print(f"[手势] 第二次食指相碰检测成功!时间戳: {current_time:.2f}")
+
                 # 检查是否满足 2 秒内碰撞两次
                 if len(self.last_index_touches) == 2:
                     t1, t2 = self.last_index_touches
                     if t2 - t1 <= 2.0:
-                        # 触发双击碰撞，重置历史防连续触发
+                        # 触发双击碰撞,重置历史防连续触发
                         self.last_index_touches.clear()
-                        print(f"[手势] 2秒内食指碰撞两次触发模式切换！时间差: {t2 - t1:.2f}秒")
+                        print(f"[手势] 2秒内食指碰撞两次触发模式切换!时间差: {t2 - t1:.2f}秒")
                         return True
         elif d_tips > release_threshold:
-            # 已经拉开距离，重置接触状态，允许下一次碰撞产生
+            # 已经拉开距离,重置接触状态,允许下一次碰撞产生
             self.index_touching = False
-            
+
         return False
 
     # ===================== 工具 =====================
@@ -634,6 +812,8 @@ class GestureDetector:
             'middle_extended': False, 'ring_extended': False, 'pinky_extended': False,
             'laser_active': False, 'drawing_active': False,
             'pinch_progress': 0.0,
+            'primary_is_pinching': False, 'secondary_is_pinching': False,
+            'secondary_index_position': None,
             'erase_gesture': False, 'mode_switch_gesture': False,
             'clap_detected': False, 'num_hands': 0,
         }
@@ -660,3 +840,6 @@ class GestureDetector:
         # 重置 1 Euro Filter
         self._euro_filter.reset()
         self._filter_initialized = False
+        if hasattr(self, '_euro_filter_secondary'):
+            self._euro_filter_secondary.reset()
+        self._filter_secondary_initialized = False

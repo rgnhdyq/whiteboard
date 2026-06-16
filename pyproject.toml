@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gesture-whiteboard"
+version = "1.0.0"
+description = "A gesture-controlled smart whiteboard system using MediaPipe and PyQt5."
+readme = "README.md"
+authors = [
+    { name = "rgnhdyq", email = "1271624891@qq.com" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+]
+dependencies = [
+    "opencv-python>=4.8.0",
+    "mediapipe>=0.10.0",
+    "PyQt5>=5.15.0",
+    "numpy>=1.20.0",
+]
+requires-python = ">=3.8"
+
+[project.scripts]
+gesture-whiteboard = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["core*"]

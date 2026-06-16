@@ -1,0 +1,6 @@
+{
+    "provider": "minimax",
+    "api_key": "",
+    "model": "MiniMax-M3",
+    "base_url": "https://api.minimaxi.com/v1"
+}

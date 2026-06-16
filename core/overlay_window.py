@@ -12,7 +12,7 @@ from collections import deque
 
 from PyQt5.QtWidgets import QApplication, QWidget, QLabel
 from PyQt5.QtCore import Qt, QTimer, QPoint, QRect, pyqtSignal, QObject
-from PyQt5.QtGui import QPainter, QPen, QColor, QPixmap, QImage, QFont, QBrush, QPainterPath
+from PyQt5.QtGui import QPainter, QPen, QColor, QPixmap, QImage, QFont, QBrush, QPainterPath, QPolygon, QPolygonF, QGuiApplication, QRegion
 
 from core.floating_menu import FloatingMenu, COLORS as MENU_COLORS, THICKNESSES as MENU_THICKNESSES
 
@@ -60,11 +60,13 @@ class OverlayWindow(QWidget):
         # 擦除位置（保留最后位置，手短暂丢失不清除）
         self.erase_pos: Optional[QPoint] = None
 
-        # 激光笔
+        # 激光笔及拖影特效
         self.laser_pos: Optional[QPoint] = None
+        self.laser_trail = deque(maxlen=25) # 记录最近25帧的轨迹作为拖影
 
         # 撤销历史（保存笔画快照）
         self.history: List[List[List[QPoint]]] = []
+        self.redo_stack: List[List[List[QPoint]]] = []
         self.max_history = 20
 
         # 摄像头预览
@@ -84,29 +86,62 @@ class OverlayWindow(QWidget):
         self.status_text = "就绪"
         self.fps_text = "FPS: 0"
 
+        # 选区缩放状态管理
+        self.selected_region: Optional[dict] = None
+        self.region_state = "none" # none, drawn_wait, selected, dragging
+        self.region_hover_frames = 0
+        self.HOVER_SELECT_FRAMES = 90  # ~1.5s
+        self._last_two_hand_dist = 0
+        self.dynamic_feedback_text = ""
+        self.dynamic_feedback_timer = 0
+
+        # LLM 分析结果（右上角白框显示）
+        self._llm_result_text = ""
+        self._llm_result_active = False
+
+        # 重新拿起已放置选区的状态
+        self._pickup_hover_frames = 0
+        self._pickup_target_index = None
+        self._pickup_cooldown_until = 0.0  # 冷却期：放下后不立刻拾取
+
         # 悬浮菜单（嵌入式，画在 OverlayWindow 内部）
         self.floating_menu = FloatingMenu(screen_w=self.screen_w, screen_h=self.screen_h)
         self._finger_pos = QPoint(0, 0)  # 当前食指屏幕坐标
 
-        # 定时器：轮询手势队列
+        # 定时器：持续拉取后台检测结果 (约 120fps 极速轮询)
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._poll_gesture)
-        self.poll_timer.start(16)  # ~60fps
+        self.poll_timer.start(8)  # ~120fps 保证绝对不漏掉后台线程的任何一帧
 
         # 定时器：更新摄像头预览
         self.cam_timer = QTimer(self)
         self.cam_timer.timeout.connect(self._update_camera)
-        self.cam_timer.start(100)  # ~10fps (降低刷新率减少线程开销)
+        self.cam_timer.start(16)  # ~60fps (最高尝试以60帧刷新右上角预览)
 
         # 键盘快捷键
         self.grabKeyboard()
 
         print(f"[Overlay] 窗口创建: {self.screen_w}x{self.screen_h}")
 
+    def _set_selected_region(self, region):
+        """设置选中区域"""
+        self.selected_region = region
+
     # ===================== 手势轮询 =====================
 
     def _poll_gesture(self):
         """从队列读取手势数据并处理"""
+        # 动态手势开关：
+        #   - 有选区且非拖动状态 → 开启
+        #   - 拖动中 / 无选区 / 非批注模式 → 关闭
+        region_dragging = (self.selected_region is not None and self.region_state == "dragging")
+        enable_dynamic = (self.mode == "annotation" and self.selected_region is not None and not region_dragging)
+        if getattr(self, '_dynamic_enabled_state', None) != enable_dynamic:
+            self._dynamic_enabled_state = enable_dynamic
+            print(f"[Overlay] enable_dynamic = {enable_dynamic} (region={self.selected_region is not None}, state={self.region_state})")
+            if self.engine:
+                self.engine.set_dynamic_gesture_enabled(enable_dynamic)
+
         try:
             gesture_data = self.gesture_queue.get_nowait()
         except queue.Empty:
@@ -133,6 +168,7 @@ class OverlayWindow(QWidget):
         clap = data.get('clap_detected', False)
         mode_switch = data.get('mode_switch_gesture', False)
         num_hands = data.get('num_hands', 0)
+        index_extended = data.get('index_extended', False)
 
         self._pinch_progress = pinch_progress
 
@@ -145,6 +181,59 @@ class OverlayWindow(QWidget):
 
         if clap:
             print("[手势] 双食指碰撞两次 → 切换模式")
+
+        primary_is_pinching = data.get('primary_is_pinching', False)
+        secondary_is_pinching = data.get('secondary_is_pinching', False)
+        secondary_pos = data.get('secondary_index_position')
+        dynamic_gesture = data.get('dynamic_gesture')
+
+        # ===== 动态大招处理 =====
+        if dynamic_gesture:
+            print(f"[Overlay] 收到动态手势: {dynamic_gesture} (region={self.selected_region is not None}, state={self.region_state})")
+        # 拖动中不响应动态手势（enable_dynamic 可能有延迟，这里做二次守卫）
+        if dynamic_gesture and dynamic_gesture in ("V", "X") and self.region_state != "dragging":
+            print(f"[手势] 触发动态大招: {dynamic_gesture}")
+
+            if dynamic_gesture == "X":
+                if self.selected_region is not None:
+                    self.dynamic_feedback_text = "X: 已擦除"
+                    self.dynamic_feedback_timer = 120
+                    # 彻底擦除：不放回画布，直接丢弃
+                    self._set_selected_region(None)
+                    self.region_state = "none"
+                    self.region_hover_frames = 0
+                    self._llm_result_active = False
+                    self._llm_result_text = ""
+                    self._pickup_cooldown_until = time.time() + 1.0
+                else:
+                    self.dynamic_feedback_text = "X: 无选区"
+                    self.dynamic_feedback_timer = 60
+
+            elif dynamic_gesture == "V":
+                if self.selected_region is not None:
+                    self.dynamic_feedback_text = "V: 正在分析..."
+                    self.dynamic_feedback_timer = 120
+                    self._trigger_llm_analysis()
+                else:
+                    self.dynamic_feedback_text = "V: 请先框选区域"
+                    self.dynamic_feedback_timer = 60
+
+            # 先屏蔽向左挥和向右挥的响应
+            # elif dynamic_gesture == "SwipeLeft":
+            #     self.dynamic_feedback_text = "⏪ Swipe Left: Undo!"
+            #     self.dynamic_feedback_timer = 60
+            #     self._undo()
+            #
+            # elif dynamic_gesture == "SwipeRight":
+            #     self.dynamic_feedback_text = "⏩ Swipe Right: Redo!"
+            #     self.dynamic_feedback_timer = 60
+            #     self._redo()
+
+            # 暂时屏蔽画圈响应
+            # elif dynamic_gesture == "Circle":
+            #     self.dynamic_feedback_text = "⭕ Circle: Select Region!"
+            #     self.dynamic_feedback_timer = 120
+            #     # TODO: 开启截屏选区逻辑
 
         # 没检测到手
         if index_pos is None or index_pos == (0, 0, 0):
@@ -163,6 +252,130 @@ class OverlayWindow(QWidget):
         self.laser_pos = QPoint(x, y)
         self._finger_pos = QPoint(x, y)
         self.five_finger_eraser = erase
+        
+        # 记录拖影（仅当食指伸直且未捏合时，即“激光笔”状态）
+        if index_extended and not primary_is_pinching:
+            self.laser_trail.append(QPoint(x, y))
+        else:
+            self.laser_trail.clear()
+
+        # 区域选择交互逻辑
+        region_handled = False
+        if self.selected_region:
+            polygon = self.selected_region['polygon']
+            center = self.selected_region['center']
+            is_inside = polygon.containsPoint(QPoint(x, y), Qt.OddEvenFill)
+
+            if self.region_state == "drawn_wait":
+                if not primary_is_pinching:
+                    if is_inside:
+                        self.region_hover_frames += 1
+                        if self.region_hover_frames >= self.HOVER_SELECT_FRAMES:
+                            self.region_state = "selected"
+                            self.selected_region['scale'] = 1.05
+                            self.region_hover_frames = 0
+                            print("[Overlay] 区域已激活选中")
+                    else:
+                        # 缓慢衰减进度，防止微小手抖导致瞬间清零
+                        self.region_hover_frames = max(0, self.region_hover_frames - 2)
+                else:
+                    if not is_inside:
+                        self._drop_region()
+
+            elif self.region_state == "selected":
+                if primary_is_pinching and secondary_is_pinching and secondary_pos:
+                    sec_x = int(secondary_pos[0] * self.screen_w)
+                    sec_y = int(secondary_pos[1] * self.screen_h)
+                    dist = np.sqrt((x - sec_x)**2 + (y - sec_y)**2)
+                    if self._last_two_hand_dist > 0:
+                        delta = dist - self._last_two_hand_dist
+                        scale_change = delta / 500.0
+                        self.selected_region['scale'] = max(0.5, min(5.0, self.selected_region['scale'] + scale_change))
+                    self._last_two_hand_dist = dist
+                    region_handled = True
+                else:
+                    self._last_two_hand_dist = 0
+                    if not primary_is_pinching:
+                        if is_inside:
+                            self.region_hover_frames += 1
+                            if self.region_hover_frames >= 45:
+                                self.region_state = "dragging"
+                                self.region_hover_frames = 0
+                                print("[Overlay] 区域抓取中")
+                        else:
+                            self.region_hover_frames = max(0, self.region_hover_frames - 2)
+                    else:
+                        if not is_inside:
+                            self._drop_region()
+
+            elif self.region_state == "dragging":
+                if primary_is_pinching:
+                    print("[Overlay] 区域已放置")
+                    self._drop_region()
+                else:
+                    dx = x - center.x()
+                    dy = y - center.y()
+                    self.selected_region['center'] = QPoint(x, y)
+                    self.selected_region['polygon'].translate(dx, dy)
+                    self.selected_region['bbox'].translate(dx, dy)
+                    region_handled = True
+
+        if region_handled:
+            self._stop_stroke()
+            self.status_text = "区域缩放/拖动中"
+            return
+
+        # ===== 重新拿起已放置的选区 =====
+        if self.selected_region is None and not primary_is_pinching and time.time() > self._pickup_cooldown_until:
+            pickup_target = None
+            for i, stroke in enumerate(self.strokes):
+                if stroke.get('type') == 'pixmap':
+                    center = stroke['center']
+                    pixmap = stroke['pixmap']
+                    # 扩大 hit 区域：pixmap 半径 + 30px 容差
+                    hit_radius = max(pixmap.width(), pixmap.height()) // 2 + 30
+                    dist_sq = (x - center.x()) ** 2 + (y - center.y()) ** 2
+                    if dist_sq < hit_radius ** 2:
+                        pickup_target = i
+                        break
+
+            if pickup_target is not None:
+                if getattr(self, '_pickup_target_index', None) == pickup_target:
+                    self._pickup_hover_frames += 1
+                    if self._pickup_hover_frames >= 30:  # ~0.5s 悬停后拿起
+                        stroke = self.strokes.pop(pickup_target)
+                        pixmap = stroke['pixmap']
+                        center = stroke['center']
+                        pw, ph = pixmap.width(), pixmap.height()
+                        bbox = QRect(center.x() - pw // 2, center.y() - ph // 2, pw, ph)
+                        # 用 bbox 四角创建 polygon，用于后续 hit test
+                        polygon = QPolygon([
+                            QPoint(bbox.left(), bbox.top()),
+                            QPoint(bbox.right(), bbox.top()),
+                            QPoint(bbox.right(), bbox.bottom()),
+                            QPoint(bbox.left(), bbox.bottom()),
+                        ])
+                        self._set_selected_region({
+                            'pixmap': pixmap,
+                            'polygon': polygon,
+                            'bbox': bbox,
+                            'center': QPoint(center),
+                            'scale': stroke.get('scale', 1.0)
+                        })
+                        self.region_state = "selected"
+                        self.region_hover_frames = 0
+                        self._pickup_hover_frames = 0
+                        self._pickup_target_index = None
+                        print(f"[Overlay] 重新拿起已放置的选区 (index={pickup_target})")
+                else:
+                    self._pickup_target_index = pickup_target
+                    self._pickup_hover_frames = 1
+            else:
+                self._pickup_target_index = None
+                self._pickup_hover_frames = 0
+        else:
+            self._pickup_target_index = None
+            self._pickup_hover_frames = 0
 
         # 悬浮菜单 hit_test（菜单区域内不执行画画/擦除）
         if self.floating_menu.in_menu_area(x):
@@ -196,19 +409,33 @@ class OverlayWindow(QWidget):
             self._stop_stroke()
             self.status_text = "激光笔"
 
-        # 拍手 → 切换模式
-        if clap:
-            self._toggle_mode()
+        # (双手相碰拍手的模式切换已按要求移除)
 
         if 'fps' in data:
             self.fps_text = f"FPS: {data['fps']:.0f}"
 
     # ===================== 绘画控制 =====================
 
+    def _copy_stroke(self, s: dict) -> dict:
+        if s.get('type') == 'pixmap':
+            return {
+                'type': 'pixmap',
+                'pixmap': s['pixmap'],
+                'center': QPoint(s['center']),
+                'scale': s['scale']
+            }
+        else:
+            return {
+                'points': s['points'][:],
+                'color': s['color'],
+                'thickness': s['thickness'],
+                'is_eraser': s['is_eraser']
+            }
+
     def _start_stroke(self):
         self.is_drawing = True
         self.current_stroke = []
-        self.history.append([{'points': s['points'][:], 'color': s['color'], 'thickness': s['thickness'], 'is_eraser': s['is_eraser']} for s in self.strokes])
+        self.history.append([self._copy_stroke(s) for s in self.strokes])
         if len(self.history) > self.max_history:
             self.history.pop(0)
 
@@ -217,21 +444,119 @@ class OverlayWindow(QWidget):
 
     def _stop_stroke(self):
         if self.is_drawing and self.current_stroke:
+            points = self.current_stroke
+            is_closed = False
+            loop_points = []
+            
+            # 检测自交叉或闭合回路 (封闭图形)
+            # 允许用户画带有长尾巴的圈，或者螺旋线，系统会自动提取出交叉形成的闭环
+            if self.mode == "annotation" and len(points) > 15:
+                best_i, best_j = -1, -1
+                min_dist = 200 ** 2  # 容忍的最大缺口距离（平方）
+                
+                # 寻找距离最近的两个点构成闭环
+                for i in range(len(points) - 15):
+                    # 采样优化性能
+                    if i % 3 != 0 and i != 0: continue
+                    p1 = points[i]
+                    for j in range(i + 15, len(points)):
+                        if j % 3 != 0 and j != len(points) - 1: continue
+                        p2 = points[j]
+                        sq_dist = (p1.x() - p2.x())**2 + (p1.y() - p2.y())**2
+                        
+                        if sq_dist < min_dist:
+                            # 验证这个环是否足够大，过滤掉原地打转的细小手抖交叉
+                            ring = points[i:j]
+                            xs = [p.x() for p in ring]
+                            ys = [p.y() for p in ring]
+                            w = max(xs) - min(xs)
+                            h = max(ys) - min(ys)
+                            if w > 30 and h > 30:
+                                min_dist = sq_dist
+                                best_i = i
+                                best_j = j
+                
+                if best_i != -1:
+                    is_closed = True
+                    loop_points = points[best_i:best_j+1]
+
             stroke_obj = {
-                'points': self.current_stroke,
+                'points': points,
                 'color': self.pen_color,
                 'thickness': self.pen_thickness,
                 'is_eraser': self.is_eraser
             }
-            self.strokes.append(stroke_obj)
+            
+            if is_closed and not self.is_eraser:
+                # 使用纯净的闭合回路建立遮罩，过滤掉多余的线段（如长尾巴）
+                effective_points = loop_points if loop_points else points
+                polygon = QPolygon(effective_points)
+                bbox = polygon.boundingRect()
+                
+                if bbox.width() > 10 and bbox.height() > 10:
+                    # 获取屏幕截图并建立遮罩
+                    screen = QGuiApplication.primaryScreen()
+                    bbox.adjust(-5, -5, 5, 5)
+                    bbox = bbox.intersected(QRect(0, 0, self.screen_w, self.screen_h))
+                    pixmap = screen.grabWindow(0, bbox.x(), bbox.y(), bbox.width(), bbox.height())
+                    
+                    masked_pixmap = QPixmap(pixmap.size())
+                    masked_pixmap.fill(Qt.transparent)
+                    
+                    painter = QPainter(masked_pixmap)
+                    painter.setRenderHint(QPainter.Antialiasing)
+                    
+                    path = QPainterPath()
+                    local_polygon = QPolygon([QPoint(p.x() - bbox.x(), p.y() - bbox.y()) for p in effective_points])
+                    path.addPolygon(QPolygonF(local_polygon))
+                    
+                    painter.setClipPath(path)
+                    painter.drawPixmap(0, 0, pixmap)
+                    
+                    # 为了明显的选中感，在外围画一圈细边框
+                    pen = QPen(QColor(0, 255, 255, 150), 2)
+                    painter.setPen(pen)
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawPath(path)
+                    painter.end()
+                    
+                    self._set_selected_region({
+                        'pixmap': masked_pixmap,
+                        'polygon': polygon,
+                        'bbox': bbox,
+                        'center': bbox.center(),
+                        'scale': 1.0
+                    })
+                    self.region_state = "drawn_wait"
+                    self.region_hover_frames = 0
+                else:
+                    self.strokes.append(stroke_obj)
+            else:
+                self.strokes.append(stroke_obj)
+
         self.is_drawing = False
         self.current_stroke = []
+
+    def _drop_region(self):
+        """将抓取的区域贴回背景或丢弃选中状态"""
+        if self.selected_region:
+            self.strokes.append({
+                'type': 'pixmap',
+                'pixmap': self.selected_region['pixmap'],
+                'center': self.selected_region['center'],
+                'scale': self.selected_region['scale']
+            })
+        self._set_selected_region(None)
+        self.region_state = "none"
+        self.region_hover_frames = 0
+        # 冷却期：防止放下后立刻被重新拾取
+        self._pickup_cooldown_until = time.time() + 1.0
 
     def _erase(self, pos: QPoint):
         """局部范围擦除：仅删除落入擦除圆圈内的点，将笔画从交汇处分裂为多段短线"""
         if not self.is_erasing:
             self.is_erasing = True
-            self.history.append([{'points': s['points'][:], 'color': s['color'], 'thickness': s['thickness'], 'is_eraser': s['is_eraser']} for s in self.strokes])
+            self.history.append([self._copy_stroke(s) for s in self.strokes])
             if len(self.history) > self.max_history:
                 self.history.pop(0)
 
@@ -240,7 +565,18 @@ class OverlayWindow(QWidget):
         new_strokes = []
         
         for stroke in self.strokes:
-            points = stroke['points']
+            # 处理通过抓取放置的图像图层
+            if stroke.get('type') == 'pixmap':
+                # 判断橡皮擦是否碰到了图像的中心区域（简单矩形碰撞）
+                # 图像如果需要被擦除，可以直接整块删除。这里暂定为保留。
+                # 如果你想让橡皮擦也能擦除图片，可以解开下面的距离判断。
+                # center = stroke['center']
+                # if (center.x() - pos.x())**2 + (center.y() - pos.y())**2 < r_sq * 4:
+                #     continue # 删除这张图
+                new_strokes.append(stroke)
+                continue
+
+            points = stroke.get('points', [])
             if not points:
                 continue
 
@@ -311,16 +647,26 @@ class OverlayWindow(QWidget):
 
     def _clear(self):
         self._stop_stroke()
-        self.history.append([{'points': s['points'][:], 'color': s['color'], 'thickness': s['thickness'], 'is_eraser': s['is_eraser']} for s in self.strokes])
+        self._drop_region()
+        self.history.append([self._copy_stroke(s) for s in self.strokes])
         self.strokes.clear()
         print("[Overlay] 已清空")
 
     def _undo(self):
         if self.history:
+            self.redo_stack.append([self._copy_stroke(s) for s in self.strokes])
             self.strokes = self.history.pop()
             print(f"[Overlay] 撤销 (剩余 {len(self.history)} 步)")
         else:
             print("[Overlay] 无可撤销")
+
+    def _redo(self):
+        if self.redo_stack:
+            self.history.append([self._copy_stroke(s) for s in self.strokes])
+            self.strokes = self.redo_stack.pop()
+            print(f"[Overlay] 重做 (剩余 {len(self.redo_stack)} 步)")
+        else:
+            print("[Overlay] 无可重做")
 
     def _toggle_mode(self):
         if self.mode == "whiteboard":
@@ -330,7 +676,38 @@ class OverlayWindow(QWidget):
             self.mode = "whiteboard"
             print("[Overlay] → 白板模式")
 
-    # ===================== 摄像头预览 =====================
+    def _trigger_llm_analysis(self):
+        """V 手势：保存选区截图，调用 API 识别图片，结果在右上角白框显示"""
+        if not self.selected_region:
+            return
+
+        import tempfile
+        import threading
+        from core.api_client import describe_image
+
+        # 保存选区截图到临时文件
+        pixmap = self.selected_region['pixmap']
+        tmp = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        pixmap.save(tmp_path, 'PNG')
+        print(f"[Overlay] 选区已保存: {tmp_path}")
+
+        # 右上角白框：显示加载中
+        self._llm_result_text = "正在识别图片..."
+        self._llm_result_active = True
+        self.update()
+
+        # 后台线程调用 API，避免阻塞 UI
+        def _analyze():
+            try:
+                result = describe_image(tmp_path)
+                self._llm_result_text = result
+            except Exception as e:
+                self._llm_result_text = f"识别失败: {str(e)[:100]}"
+            self.update()
+
+        threading.Thread(target=_analyze, daemon=True).start()
 
     def _update_camera(self):
         """更新摄像头预览"""
@@ -397,6 +774,18 @@ class OverlayWindow(QWidget):
             }
             self._draw_stroke(painter, current_stroke_obj)
 
+        # ===== 激光笔拖影特效 =====
+        if len(self.laser_trail) > 1:
+            for i in range(len(self.laser_trail) - 1):
+                p1 = self.laser_trail[i]
+                p2 = self.laser_trail[i+1]
+                # 越老的点透明度越低
+                alpha = int(255 * (i / len(self.laser_trail)))
+                # 画笔变粗一点，带有发光感
+                pen = QPen(QColor(0, 255, 255, alpha), 6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+                painter.setPen(pen)
+                painter.drawLine(p1, p2)
+
         # ===== 擦除圆圈 =====
         if self.erase_pos and self.five_finger_eraser:
             painter.setPen(QPen(QColor(200, 200, 200), 2))
@@ -417,11 +806,81 @@ class OverlayWindow(QWidget):
         # ===== 底部状态栏 =====
         self._draw_status_bar(painter)
 
-        # ===== 顶部模式标签 =====
-        painter.setPen(QColor(0, 255, 0))
-        painter.setFont(QFont("Microsoft YaHei", 14, QFont.Bold))
-        mode_text = "白板模式" if self.mode == "whiteboard" else "屏幕批注"
-        painter.drawText(10, 30, f"[{mode_text}]")
+        # ===== 绘制状态提示
+        painter.setPen(QColor(255, 255, 255))
+        painter.setFont(QFont("Arial", 14, QFont.Bold))
+        painter.drawText(10, 30, f"Mode: {self.mode}")
+        painter.drawText(10, 60, f"Status: {self.status_text}")
+        
+        # 绘制动态手势超级大字反馈
+        if self.dynamic_feedback_timer > 0:
+            self.dynamic_feedback_timer -= 1
+            painter.setPen(QColor(0, 255, 255, min(255, self.dynamic_feedback_timer * 10)))
+            painter.setFont(QFont("Arial", 60, QFont.Bold))
+            rect = QRect(0, 0, self.screen_w, self.screen_h)
+            painter.drawText(rect, Qt.AlignCenter, self.dynamic_feedback_text)
+
+        # ===== 右上角 LLM 分析结果白框（自适应高度）=====
+        if self._llm_result_active and self._llm_result_text:
+            from PyQt5.QtGui import QFontMetrics
+            box_w = 450
+            box_x = self.screen_w - box_w - 20
+            box_y = 20
+            padding = 20
+            header_h = 30
+
+            # 计算文本所需高度
+            painter.setFont(QFont("Arial", 10))
+            fm = QFontMetrics(painter.font())
+            text_area_w = box_w - padding * 2
+            text_rect = QRect(0, 0, text_area_w, 10000)
+            text_h = fm.boundingRect(text_rect, Qt.TextWordWrap, self._llm_result_text).height()
+            box_h = header_h + text_h + padding * 2
+            box_h = max(box_h, 80)  # 最小高度
+
+            painter.fillRect(QRect(box_x, box_y, box_w, box_h), QColor(255, 255, 255, 220))
+            painter.setPen(QPen(QColor(0, 0, 0), 2))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(QRect(box_x, box_y, box_w, box_h))
+            painter.setPen(QColor(0, 0, 0))
+            painter.setFont(QFont("Arial", 12, QFont.Bold))
+            painter.drawText(box_x + 10, box_y + 22, "AI Analysis")
+            painter.setFont(QFont("Arial", 10))
+            text_draw_rect = QRect(box_x + padding, box_y + header_h, text_area_w, text_h + 10)
+            painter.drawText(text_draw_rect, Qt.TextWordWrap, self._llm_result_text)
+
+        # ===== 被抓取的区域 =====
+        if self.selected_region:
+            pixmap = self.selected_region['pixmap']
+            center = self.selected_region['center']
+            scale = self.selected_region['scale']
+            
+            painter.save()
+            painter.translate(center)
+            painter.scale(scale, scale)
+            painter.drawPixmap(-pixmap.width() // 2, -pixmap.height() // 2, pixmap)
+            painter.restore()
+
+            # Hover progress ring
+            if self.region_hover_frames > 0 and self.laser_pos:
+                pen = QPen(QColor(0, 255, 255), 4)
+                painter.setPen(pen)
+                painter.setBrush(Qt.NoBrush)
+                r = 20
+                rect = QRect(self.laser_pos.x() - r, self.laser_pos.y() - r, r * 2, r * 2)
+                max_frames = self.HOVER_SELECT_FRAMES if self.region_state == "drawn_wait" else 45
+                span_angle = int((self.region_hover_frames / max_frames) * 360 * 16)
+                painter.drawArc(rect, 90 * 16, span_angle)
+
+        # ===== 拾取已放置选区的进度环 =====
+        if self._pickup_hover_frames > 0 and self.laser_pos and self.selected_region is None:
+            pen = QPen(QColor(255, 200, 0), 4)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            r = 25
+            rect = QRect(self.laser_pos.x() - r, self.laser_pos.y() - r, r * 2, r * 2)
+            span_angle = int((self._pickup_hover_frames / 30) * 360 * 16)
+            painter.drawArc(rect, 90 * 16, span_angle)
 
         # ===== 悬浮菜单 =====
         laser_x = self.laser_pos.x() if self.laser_pos else None
@@ -450,8 +909,19 @@ class OverlayWindow(QWidget):
         painter.end()
 
     def _draw_stroke(self, painter: QPainter, stroke: dict):
-        """绘制一条笔画"""
-        points = stroke['points']
+        """绘制一条笔画或图像图层"""
+        if stroke.get('type') == 'pixmap':
+            pixmap = stroke['pixmap']
+            center = stroke['center']
+            scale = stroke['scale']
+            painter.save()
+            painter.translate(center)
+            painter.scale(scale, scale)
+            painter.drawPixmap(-pixmap.width() // 2, -pixmap.height() // 2, pixmap)
+            painter.restore()
+            return
+
+        points = stroke.get('points', [])
         if len(points) < 2:
             return
 

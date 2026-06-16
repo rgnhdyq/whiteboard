@@ -9,3 +9,24 @@ env/
 .vscode/
 *.log
 .system_generated/
+
+# 构建产物
+build/
+dist/
+*.spec
+*.egg-info/
+
+# 敏感信息
+api_key.txt
+api_config.json
+
+# 大文件
+data/gestures/
+models/gesture_transformer.pth
+models/hand_landmarker.task
+
+# 报告（本地保留）
+*.docx
+*.pptx
+report_draft*.md
+report_final.md
